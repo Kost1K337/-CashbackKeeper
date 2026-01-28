@@ -140,7 +140,8 @@ class UpdateCategoryFSM(StatesGroup):
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗂 Мои карты", callback_data="my_cards")],
-        [InlineKeyboardButton(text="💰 Посмотреть все мои кешбеки", callback_data="view_cashback")],
+        [InlineKeyboardButton(text="💰 Посмотреть мои кешбеки", callback_data="view_cashback")],
+        [InlineKeyboardButton(text="💡 Лучший выбор по категориям", callback_data="best_by_category")],
         [InlineKeyboardButton(text="🔜 Подобрать карту под покупку", callback_data="pick_card")],
     ])
 
@@ -307,6 +308,50 @@ async def view_cashback(callback: types.CallbackQuery):
             text += f"💳 {card}: категории не добавлены\n"
     await callback.message.edit_text(text, reply_markup=main_menu())
     await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "best_by_category")
+async def best_by_category(callback: types.CallbackQuery):
+    telegram_id = callback.from_user.id
+    user_id = get_or_create_user(telegram_id)
+    cards = get_cards(user_id)
+    if not cards:
+        await callback.message.edit_text("У вас пока нет карт", reply_markup=main_menu())
+        await callback.answer()
+        return
+
+    # Словарь категорий: category_name -> (best_card_name, cashback)
+    category_best = {}
+    for card in cards:
+        card_id = get_card_id(user_id, card)
+        categories = get_categories(card_id)
+        for name, cb in categories:
+            if name not in category_best or cb > category_best[name][1]:
+                category_best[name] = (card, cb)
+
+    if not category_best:
+        await callback.message.edit_text("Нет категорий для карт 😔", reply_markup=main_menu())
+        await callback.answer()
+        return
+
+    # Формируем текст в стиле view_cashback
+    text = "💡 Лучший выбор по категориям:\n\n"
+    # Для удобства сгруппируем по карте
+    card_dict = {}
+    for cat, (card, cb) in category_best.items():
+        if card not in card_dict:
+            card_dict[card] = []
+        card_dict[card].append((cat, cb))
+
+    for card, categories in card_dict.items():
+        text += f"💳 {card}:\n"
+        for name, cb in categories:
+            text += f" - {name}: {cb}%\n"
+        text += "\n"
+
+    await callback.message.edit_text(text, reply_markup=main_menu())
+    await callback.answer()
+
+
 
 # ---------------------------
 # Подбор карты (пока анонс)
