@@ -1,186 +1,327 @@
 import asyncio
 import os
 from dotenv import load_dotenv
-
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import sqlite3
 
-from database import (
-    init_db,
-    get_or_create_user,
-    add_card,
-    get_cards,
-    get_card_id,
-    add_category,
-    get_best_cashback,
-)
-
-# ---------------- config ----------------
+# ---------------------------
+# Загрузка токена
+# ---------------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+# ---------------------------
+# Работа с базой
+# ---------------------------
+DB_PATH = "bot.db"
+
+def get_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+def init_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER UNIQUE
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS cards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        bank TEXT,
+        name TEXT,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS categories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        card_id INTEGER,
+        name TEXT,
+        cashback INTEGER,
+        FOREIGN KEY(card_id) REFERENCES cards(id) ON DELETE CASCADE
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_or_create_user(telegram_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (telegram_id,))
+    conn.commit()
+    cursor.execute("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,))
+    user_id = cursor.fetchone()[0]
+    conn.close()
+    return user_id
+
+def add_card(user_id, bank, card_name):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO cards (user_id, bank, name) VALUES (?, ?, ?)", (user_id, bank, card_name))
+    conn.commit()
+    card_id = cursor.lastrowid
+    conn.close()
+    return card_id
+
+def get_cards(user_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM cards WHERE user_id = ?", (user_id,))
+    result = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return result
+
+def add_category(card_id, name, cashback):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO categories (card_id, name, cashback) VALUES (?, ?, ?)", (card_id, name, cashback))
+    conn.commit()
+    conn.close()
+
+def get_card_id(user_id, card_name):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM cards WHERE user_id = ? AND name = ?", (user_id, card_name))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def delete_card(user_id, card_name):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM cards WHERE user_id = ? AND name = ?", (user_id, card_name))
+    conn.commit()
+    conn.close()
+
+def update_category(card_id, category_name, cashback):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE categories SET cashback = ? WHERE card_id = ? AND name = ?", (cashback, card_id, category_name))
+    conn.commit()
+    conn.close()
+
+def get_categories(card_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name, cashback FROM categories WHERE card_id = ?", (card_id,))
+    result = cursor.fetchall()
+    conn.close()
+    return result
+
+# ---------------------------
+# FSM
+# ---------------------------
+class AddCardFSM(StatesGroup):
+    waiting_for_bank = State()
+    waiting_for_card_name = State()
+    waiting_for_category_name = State()
+    waiting_for_category_percent = State()
+    waiting_for_more_categories = State()  # Inline кнопки "еще категорию" / "завершить"
+
+# FSM для обновления кешбека
+class UpdateCategoryFSM(StatesGroup):
+    waiting_for_card = State()
+    waiting_for_category = State()
+    waiting_for_percent = State()
+
+# ---------------------------
+# Кнопки
+# ---------------------------
+def main_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗂 Мои карты", callback_data="my_cards")],
+        [InlineKeyboardButton(text="💰 Посмотреть мои кешбеки", callback_data="view_cashback")],
+        [InlineKeyboardButton(text="🔜 Подобрать карту под покупку", callback_data="pick_card")],
+    ])
+
+def bank_keyboard():
+    banks = ["Сбербанк", "ВТБ", "Альфа-Банк", "Т-Банк", "Газпромбанк", "Другой"]
+    buttons = [[InlineKeyboardButton(text=b, callback_data=f"bank:{b}")] for b in banks]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def user_cards_keyboard(user_id):
+    cards = get_cards(user_id)
+    buttons = [[InlineKeyboardButton(text=c, callback_data=f"card:{c}")] for c in cards]
+    buttons.append([InlineKeyboardButton(text="➕ Добавить новую карту", callback_data="add_card")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def card_actions_keyboard(card_name):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить кешбек", callback_data=f"update_cb:{card_name}")],
+        [InlineKeyboardButton(text="❌ Удалить карту", callback_data=f"delete_card:{card_name}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="my_cards")],
+    ])
+
+def more_categories_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Еще категорию", callback_data="more_category")],
+        [InlineKeyboardButton(text="✅ Завершить создание карты", callback_data="finish_card")],
+    ])
+
+# ---------------------------
+# Бот
+# ---------------------------
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ---------------- FSM ----------------
-class AddCardFSM(StatesGroup):
-    waiting_for_card_name = State()
-
-
-class FillCashbackFSM(StatesGroup):
-    waiting_for_card = State()
-    waiting_for_category = State()
-    waiting_for_cashback = State()
-
-# ---------------- keyboards ----------------
-def main_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить карту", callback_data="add_card")],
-        [InlineKeyboardButton(text="🧾 Заполнить кешбеки моих карт", callback_data="fill_cashback")],
-        [InlineKeyboardButton(text="💰 Посмотреть мой кешбек", callback_data="show_cashback")]
-    ])
-
-
-def cards_keyboard(user_id: int):
-    cards = get_cards(user_id)
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=name, callback_data=f"card:{name}")]
-        for _, name in cards
-    ])
-
-
-def continue_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить ещё категорию", callback_data="add_more")],
-        [InlineKeyboardButton(text="✅ Закончить", callback_data="finish")]
-    ])
-
-# ---------------- start ----------------
+# ---------------------------
+# /start
+# ---------------------------
 @dp.message(Command("start"))
 async def start(message: types.Message):
-    get_or_create_user(message.from_user.id)
     await message.answer(
-        "Привет! Я помогу тебе следить за кешбеком 💳",
+        "Привет! Я помогу управлять твоими картами 💳",
         reply_markup=main_menu()
     )
 
-# ---------------- add card ----------------
+# ---------------------------
+# Главное меню через кнопки
+# ---------------------------
+@dp.callback_query(lambda c: c.data == "back_main")
+async def back_main(callback: types.CallbackQuery):
+    await callback.message.edit_text("Главное меню:", reply_markup=main_menu())
+    await callback.answer()
+
+# ---------------------------
+# Мои карты
+# ---------------------------
+@dp.callback_query(lambda c: c.data == "my_cards")
+async def my_cards(callback: types.CallbackQuery):
+    telegram_id = callback.from_user.id
+    user_id = get_or_create_user(telegram_id)
+    await callback.message.edit_text("Мои карты:", reply_markup=user_cards_keyboard(user_id))
+    await callback.answer()
+
+# ---------------------------
+# Действия с картой
+# ---------------------------
+@dp.callback_query(lambda c: c.data.startswith("card:"))
+async def card_actions(callback: types.CallbackQuery):
+    card_name = callback.data.split(":", 1)[1]
+    await callback.message.edit_text(f"Выбрана карта: {card_name}", reply_markup=card_actions_keyboard(card_name))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("delete_card:"))
+async def delete_card_callback(callback: types.CallbackQuery):
+    card_name = callback.data.split(":", 1)[1]
+    telegram_id = callback.from_user.id
+    user_id = get_or_create_user(telegram_id)
+    delete_card(user_id, card_name)
+    await callback.message.edit_text(f"✅ Карта «{card_name}» удалена", reply_markup=user_cards_keyboard(user_id))
+    await callback.answer()
+
+# ---------------------------
+# Добавление карты
+# ---------------------------
 @dp.callback_query(lambda c: c.data == "add_card")
 async def add_card_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите название карты:")
+    await callback.message.edit_text("Выберите банк:", reply_markup=bank_keyboard())
+    await state.set_state(AddCardFSM.waiting_for_bank)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("bank:"))
+async def add_card_bank(callback: types.CallbackQuery, state: FSMContext):
+    bank_name = callback.data.split(":",1)[1]
+    await state.update_data(bank=bank_name)
+    await callback.message.edit_text(f"Выбран банк: {bank_name}\nВведите название карты:")
     await state.set_state(AddCardFSM.waiting_for_card_name)
     await callback.answer()
 
-
 @dp.message(AddCardFSM.waiting_for_card_name)
-async def add_card_finish(message: types.Message, state: FSMContext):
-    user_id = get_or_create_user(message.from_user.id)
+async def add_card_name(message: types.Message, state: FSMContext):
     card_name = message.text.strip()
+    telegram_id = message.from_user.id
+    user_id = get_or_create_user(telegram_id)
+    data = await state.get_data()
+    bank = data["bank"]
+    card_id = add_card(user_id, bank, card_name)
+    await state.update_data(card_id=card_id)
+    await message.answer("Введите название категории для кешбека:")
+    await state.set_state(AddCardFSM.waiting_for_category_name)
 
-    if card_name in [name for _, name in get_cards(user_id)]:
-        await message.answer("❌ Такая карта уже есть.")
-        return
+@dp.message(AddCardFSM.waiting_for_category_name)
+async def add_category_name(message: types.Message, state: FSMContext):
+    await state.update_data(category_name=message.text.strip())
+    await message.answer("Введите процент кешбека (например 5):")
+    await state.set_state(AddCardFSM.waiting_for_category_percent)
 
-    add_card(user_id, card_name)
-    await message.answer(f"✅ Карта «{card_name}» добавлена", reply_markup=main_menu())
-    await state.clear()
-
-# ---------------- fill cashback ----------------
-@dp.callback_query(lambda c: c.data == "fill_cashback")
-async def fill_cashback_start(callback: types.CallbackQuery, state: FSMContext):
-    user_id = get_or_create_user(callback.from_user.id)
-    if not get_cards(user_id):
-        await callback.message.answer("❌ Сначала добавьте карту.")
-        await callback.answer()
-        return
-
-    await callback.message.answer(
-        "Выберите карту:",
-        reply_markup=cards_keyboard(user_id)
-    )
-    await state.set_state(FillCashbackFSM.waiting_for_card)
-    await callback.answer()
-
-
-@dp.callback_query(lambda c: c.data.startswith("card:"))
-async def choose_card(callback: types.CallbackQuery, state: FSMContext):
-    card_name = callback.data.split(":", 1)[1]
-    await state.update_data(card_name=card_name)
-    await callback.message.answer("Введите название категории:")
-    await state.set_state(FillCashbackFSM.waiting_for_category)
-    await callback.answer()
-
-
-@dp.message(FillCashbackFSM.waiting_for_category)
-async def input_category(message: types.Message, state: FSMContext):
-    await state.update_data(category=message.text.strip())
-    await message.answer("Введите кешбек в процентах:")
-    await state.set_state(FillCashbackFSM.waiting_for_cashback)
-
-
-@dp.message(FillCashbackFSM.waiting_for_cashback)
-async def input_cashback(message: types.Message, state: FSMContext):
+@dp.message(AddCardFSM.waiting_for_category_percent)
+async def add_category_percent(message: types.Message, state: FSMContext):
     try:
-        cashback = int(message.text)
-        if not 0 <= cashback <= 100:
+        percent = int(message.text.strip())
+        if not (0 <= percent <= 100):
             raise ValueError
     except ValueError:
         await message.answer("❌ Введите число от 0 до 100")
         return
-
     data = await state.get_data()
-    user_id = get_or_create_user(message.from_user.id)
-    card_id = get_card_id(user_id, data["card_name"])
+    add_category(data["card_id"], data["category_name"], percent)
+    await message.answer(f"✅ Категория «{data['category_name']}» с кешбеком {percent}% добавлена", reply_markup=more_categories_keyboard())
+    await state.set_state(AddCardFSM.waiting_for_more_categories)
 
-    add_category(card_id, data["category"], cashback)
-
-    await message.answer(
-        f"✅ Категория «{data['category']}» добавлена",
-        reply_markup=continue_keyboard()
-    )
-
-    await state.set_state(FillCashbackFSM.waiting_for_category)
-
-# ---------------- continue / finish ----------------
-@dp.callback_query(lambda c: c.data == "add_more")
-async def add_more(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите название следующей категории:")
-    await state.set_state(FillCashbackFSM.waiting_for_category)
+@dp.callback_query(lambda c: c.data == "more_category")
+async def more_category(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введите название следующей категории:")
+    await state.set_state(AddCardFSM.waiting_for_category_name)
     await callback.answer()
 
-
-@dp.callback_query(lambda c: c.data == "finish")
-async def finish(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(lambda c: c.data == "finish_card")
+async def finish_card(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Карта создана ✅", reply_markup=main_menu())
     await state.clear()
-    await callback.message.answer("✅ Кешбеки сохранены", reply_markup=main_menu())
     await callback.answer()
 
-# ---------------- show cashback ----------------
-@dp.callback_query(lambda c: c.data == "show_cashback")
-async def show_cashback(callback: types.CallbackQuery):
-    user_id = get_or_create_user(callback.from_user.id)
-    rows = get_best_cashback(user_id)
-
-    if not rows:
-        await callback.message.answer("❌ Кешбеки ещё не заполнены.")
+# ---------------------------
+# Просмотр кешбеков
+# ---------------------------
+@dp.callback_query(lambda c: c.data == "view_cashback")
+async def view_cashback(callback: types.CallbackQuery):
+    telegram_id = callback.from_user.id
+    user_id = get_or_create_user(telegram_id)
+    cards = get_cards(user_id)
+    if not cards:
+        await callback.message.edit_text("У вас пока нет карт", reply_markup=main_menu())
         await callback.answer()
         return
-
-    text = "💰 *Ваш максимальный кешбек:*\n\n"
-    for category, cashback, card in rows:
-        text += f"• {category} — *{cashback}%* (карта: {card})\n"
-
-    await callback.message.answer(text, parse_mode="Markdown")
+    text = ""
+    for card in cards:
+        card_id = get_card_id(user_id, card)
+        categories = get_categories(card_id)
+        if categories:
+            text += f"💳 {card}:\n"
+            for name, cb in categories:
+                text += f" - {name}: {cb}%\n"
+        else:
+            text += f"💳 {card}: категории не добавлены\n"
+    await callback.message.edit_text(text, reply_markup=main_menu())
     await callback.answer()
 
-# ---------------- run ----------------
+# ---------------------------
+# Подбор карты (пока анонс)
+# ---------------------------
+@dp.callback_query(lambda c: c.data == "pick_card")
+async def pick_card(callback: types.CallbackQuery):
+    await callback.message.edit_text("Функционал подбора карты появится скоро 🔜", reply_markup=main_menu())
+    await callback.answer()
+
+# ---------------------------
+# Запуск
+# ---------------------------
 async def main():
     init_db()
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
