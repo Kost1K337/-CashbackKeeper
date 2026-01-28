@@ -65,9 +65,10 @@ def get_or_create_user(telegram_id):
     return user_id
 
 def add_card(user_id, bank, card_name):
+    full_name = f"{bank} – {card_name}"
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO cards (user_id, bank, name) VALUES (?, ?, ?)", (user_id, bank, card_name))
+    cursor.execute("INSERT INTO cards (user_id, bank, name) VALUES (?, ?, ?)", (user_id, bank, full_name))
     conn.commit()
     card_id = cursor.lastrowid
     conn.close()
@@ -126,9 +127,8 @@ class AddCardFSM(StatesGroup):
     waiting_for_card_name = State()
     waiting_for_category_name = State()
     waiting_for_category_percent = State()
-    waiting_for_more_categories = State()  # Inline кнопки "еще категорию" / "завершить"
+    waiting_for_more_categories = State()
 
-# FSM для обновления кешбека
 class UpdateCategoryFSM(StatesGroup):
     waiting_for_card = State()
     waiting_for_category = State()
@@ -140,7 +140,7 @@ class UpdateCategoryFSM(StatesGroup):
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗂 Мои карты", callback_data="my_cards")],
-        [InlineKeyboardButton(text="💰 Посмотреть мои кешбеки", callback_data="view_cashback")],
+        [InlineKeyboardButton(text="💰 Посмотреть все мои кешбеки", callback_data="view_cashback")],
         [InlineKeyboardButton(text="🔜 Подобрать карту под покупку", callback_data="pick_card")],
     ])
 
