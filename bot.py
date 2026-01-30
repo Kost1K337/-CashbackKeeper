@@ -77,8 +77,8 @@ def add_card(user_id, bank, card_name):
 def get_cards(user_id):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT name FROM cards WHERE user_id = ?", (user_id,))
-    result = [row[0] for row in cursor.fetchall()]
+    cursor.execute("SELECT id, name FROM cards WHERE user_id = ?", (user_id,))
+    result = cursor.fetchall()  # [(id, name), ...]
     conn.close()
     return result
 
@@ -89,18 +89,20 @@ def add_category(card_id, name, cashback):
     conn.commit()
     conn.close()
 
-def get_card_id(user_id, card_name):
+def get_card_by_id(card_id):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM cards WHERE user_id = ? AND name = ?", (user_id, card_name))
+    cursor.execute("SELECT id, user_id, bank, name FROM cards WHERE id = ?", (card_id,))
     row = cursor.fetchone()
     conn.close()
-    return row[0] if row else None
+    if row:
+        return {"id": row[0], "user_id": row[1], "bank": row[2], "name": row[3]}
+    return None
 
-def delete_card(user_id, card_name):
+def delete_card(card_id):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM cards WHERE user_id = ? AND name = ?", (user_id, card_name))
+    cursor.execute("DELETE FROM cards WHERE id = ?", (card_id,))
     conn.commit()
     conn.close()
 
@@ -153,15 +155,15 @@ def bank_keyboard():
 
 def user_cards_keyboard(user_id):
     cards = get_cards(user_id)
-    buttons = [[InlineKeyboardButton(text=c, callback_data=f"card:{c}")] for c in cards]
+    buttons = [[InlineKeyboardButton(text=name, callback_data=f"card:{cid}")] for cid, name in cards]
     buttons.append([InlineKeyboardButton(text="➕ Добавить новую карту", callback_data="add_card")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def card_actions_keyboard(card_name):
+def card_actions_keyboard(card_id, card_name):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить кешбек", callback_data=f"update_cb:{card_name}")],
-        [InlineKeyboardButton(text="❌ Удалить карту", callback_data=f"delete_card:{card_name}")],
+        [InlineKeyboardButton(text="🔄 Обновить кешбек", callback_data=f"update_cb:{card_id}")],
+        [InlineKeyboardButton(text="❌ Удалить карту", callback_data=f"delete_card:{card_id}")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="my_cards")],
     ])
 
@@ -204,7 +206,6 @@ async def my_cards(callback: types.CallbackQuery):
     user_id = get_or_create_user(telegram_id)
 
     cards = get_cards(user_id)
-
     if not cards:
         await callback.message.answer(
             "У тебя пока нет карт 👀\n\nДобавь первую 👇",
@@ -218,23 +219,30 @@ async def my_cards(callback: types.CallbackQuery):
 
     await callback.answer()
 
-
 # ---------------------------
 # Действия с картой
 # ---------------------------
 @dp.callback_query(lambda c: c.data.startswith("card:"))
 async def card_actions(callback: types.CallbackQuery):
-    card_name = callback.data.split(":", 1)[1]
-    await callback.message.edit_text(f"Выбрана карта: {card_name}", reply_markup=card_actions_keyboard(card_name))
+    card_id = int(callback.data.split(":", 1)[1])
+    card = get_card_by_id(card_id)
+    if not card:
+        await callback.answer("❌ Карта не найдена")
+        return
+    await callback.message.edit_text(f"Выбрана карта: {card['name']}", reply_markup=card_actions_keyboard(card_id, card['name']))
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("delete_card:"))
 async def delete_card_callback(callback: types.CallbackQuery):
-    card_name = callback.data.split(":", 1)[1]
+    card_id = int(callback.data.split(":", 1)[1])
+    card = get_card_by_id(card_id)
+    if not card:
+        await callback.answer("❌ Карта не найдена")
+        return
+    delete_card(card_id)
     telegram_id = callback.from_user.id
     user_id = get_or_create_user(telegram_id)
-    delete_card(user_id, card_name)
-    await callback.message.edit_text(f"✅ Карта «{card_name}» удалена", reply_markup=user_cards_keyboard(user_id))
+    await callback.message.edit_text(f"✅ Карта «{card['name']}» удалена", reply_markup=user_cards_keyboard(user_id))
     await callback.answer()
 
 # ---------------------------
@@ -311,18 +319,20 @@ async def view_cashback(callback: types.CallbackQuery):
         await callback.answer()
         return
     text = ""
-    for card in cards:
-        card_id = get_card_id(user_id, card)
+    for card_id, card_name in cards:
         categories = get_categories(card_id)
         if categories:
-            text += f"💳 {card}:\n"
+            text += f"💳 {card_name}:\n"
             for name, cb in categories:
                 text += f" - {name}: {cb}%\n"
         else:
-            text += f"💳 {card}: категории не добавлены\n"
+            text += f"💳 {card_name}: категории не добавлены\n"
     await callback.message.edit_text(text, reply_markup=main_menu())
     await callback.answer()
 
+# ---------------------------
+# Лучший выбор по категориям
+# ---------------------------
 @dp.callback_query(lambda c: c.data == "best_by_category")
 async def best_by_category(callback: types.CallbackQuery):
     telegram_id = callback.from_user.id
@@ -333,23 +343,20 @@ async def best_by_category(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    # Словарь категорий: category_name -> (best_card_name, cashback)
+    # category_name -> (best_card_name, cashback)
     category_best = {}
-    for card in cards:
-        card_id = get_card_id(user_id, card)
+    for card_id, card_name in cards:
         categories = get_categories(card_id)
         for name, cb in categories:
             if name not in category_best or cb > category_best[name][1]:
-                category_best[name] = (card, cb)
+                category_best[name] = (card_name, cb)
 
     if not category_best:
         await callback.message.edit_text("Нет категорий для карт 😔", reply_markup=main_menu())
         await callback.answer()
         return
 
-    # Формируем текст в стиле view_cashback
     text = "💡 Лучший выбор по категориям:\n\n"
-    # Для удобства сгруппируем по карте
     card_dict = {}
     for cat, (card, cb) in category_best.items():
         if card not in card_dict:
@@ -364,8 +371,6 @@ async def best_by_category(callback: types.CallbackQuery):
 
     await callback.message.edit_text(text, reply_markup=main_menu())
     await callback.answer()
-
-
 
 # ---------------------------
 # Подбор карты (пока анонс)
