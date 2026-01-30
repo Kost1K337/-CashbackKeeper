@@ -202,8 +202,22 @@ async def back_main(callback: types.CallbackQuery):
 async def my_cards(callback: types.CallbackQuery):
     telegram_id = callback.from_user.id
     user_id = get_or_create_user(telegram_id)
-    await callback.message.edit_text("Мои карты:", reply_markup=user_cards_keyboard(user_id))
+
+    cards = get_cards(user_id)
+
+    if not cards:
+        await callback.message.answer(
+            "У тебя пока нет карт 👀\n\nДобавь первую 👇",
+            reply_markup=user_cards_keyboard(user_id)
+        )
+    else:
+        await callback.message.answer(
+            "Мои карты:",
+            reply_markup=user_cards_keyboard(user_id)
+        )
+
     await callback.answer()
+
 
 # ---------------------------
 # Действия с картой
