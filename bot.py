@@ -145,6 +145,7 @@ def main_menu():
         [InlineKeyboardButton(text="💰 Посмотреть мои кешбеки", callback_data="view_cashback")],
         [InlineKeyboardButton(text="💡 Лучший выбор по категориям", callback_data="best_by_category")],
         [InlineKeyboardButton(text="🔜 Подобрать карту под покупку", callback_data="pick_card")],
+        [InlineKeyboardButton(text="✉️ Написать разработчику", url="https://t.me/Kost1K337")],
     ])
 
 def bank_keyboard():
@@ -305,6 +306,75 @@ async def finish_card(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Карта создана ✅", reply_markup=main_menu())
     await state.clear()
     await callback.answer()
+
+# ---------------------------
+# Обновление кешбека
+# ---------------------------
+
+@dp.callback_query(lambda c: c.data.startswith("update_cb:"))
+async def update_cb_start(callback: types.CallbackQuery, state: FSMContext):
+    card_id = int(callback.data.split(":", 1)[1])
+    card = get_card_by_id(card_id)
+
+    if not card:
+        await callback.answer("❌ Карта не найдена")
+        return
+
+    categories = get_categories(card_id)
+    if not categories:
+        await callback.answer("У карты нет категорий")
+        return
+
+    await state.update_data(card_id=card_id)
+
+    text = f"Обновление кешбека для карты:\n{card['name']}\n\nВыберите категорию:"
+    buttons = [
+        [InlineKeyboardButton(text=name, callback_data=f"update_cat:{name}")]
+        for name, _ in categories
+    ]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"card:{card_id}")])
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+    await state.set_state(UpdateCategoryFSM.waiting_for_category)
+    await callback.answer()
+
+
+@dp.callback_query(UpdateCategoryFSM.waiting_for_category, lambda c: c.data.startswith("update_cat:"))
+async def update_cb_choose_category(callback: types.CallbackQuery, state: FSMContext):
+    category_name = callback.data.split(":", 1)[1]
+    await state.update_data(category_name=category_name)
+
+    await callback.message.edit_text(
+        f"Введите новый процент кешбека для категории «{category_name}»:"
+    )
+
+    await state.set_state(UpdateCategoryFSM.waiting_for_percent)
+    await callback.answer()
+
+
+@dp.message(UpdateCategoryFSM.waiting_for_percent)
+async def update_cb_percent(message: types.Message, state: FSMContext):
+    try:
+        percent = int(message.text.strip())
+        if not (0 <= percent <= 100):
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите число от 0 до 100")
+        return
+
+    data = await state.get_data()
+    update_category(data["card_id"], data["category_name"], percent)
+
+    await message.answer(
+        f"✅ Кешбек обновлён: {data['category_name']} — {percent}%",
+        reply_markup=main_menu()
+    )
+
+    await state.clear()
 
 # ---------------------------
 # Просмотр кешбеков
